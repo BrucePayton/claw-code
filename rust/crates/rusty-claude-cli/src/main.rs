@@ -11313,9 +11313,15 @@ mod tests {
 
     #[test]
     fn prompt_subcommand_allows_literal_typo_word() {
-        assert_eq!(
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let result = with_current_dir(&root, || {
             parse_args(&["prompt".to_string(), "doctorr".to_string()])
-                .expect("explicit prompt subcommand should allow literal typo word"),
+                .expect("explicit prompt subcommand should allow literal typo word")
+        });
+        assert_eq!(
+            result,
             CliAction::Prompt {
                 prompt: "doctorr".to_string(),
                 model: DEFAULT_MODEL.to_string(),
@@ -11613,6 +11619,10 @@ mod tests {
         let _guard = env_lock();
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
+        // Isolate config home to prevent loading system MCP servers (which could
+        // produce pydantic errors if they expect JSON-lines instead of Content-Length)
+        let config_home = temp_dir();
+        std::env::set_var("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8"));
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
 
@@ -11631,7 +11641,9 @@ mod tests {
         assert!(banner.contains("workflow completions"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(&config_home).expect("cleanup config home");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAW_CONFIG_HOME");
     }
 
     #[test]
