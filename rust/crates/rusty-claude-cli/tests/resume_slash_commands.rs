@@ -614,7 +614,24 @@ fn resumed_stub_command_emits_not_implemented_json() {
 }
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
-    run_claw_with_env(current_dir, args, &[])
+    // Use an isolated config home to prevent loading system MCP servers
+    let config_home = std::env::temp_dir().join(format!(
+        "claw-test-config-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    run_claw_with_env(
+        current_dir,
+        args,
+        &[(
+            "CLAW_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home path"),
+        )],
+    )
 }
 
 fn workspace_session(root: &Path) -> Session {
