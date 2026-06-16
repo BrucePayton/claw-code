@@ -1080,56 +1080,88 @@ impl McpServerManager {
                 return Ok(());
             }
 
-            let request_id = self.take_request_id();
-            let response = {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+            // Try JSON-lines first, then fallback to Content-Length
+            // Python mcp SDK uses JSON-lines by default; official MCP spec uses Content-Length
+            let framing_attempts: [McpFraming; 2] = if attempts == 0 {
+                [McpFraming::JsonLines, McpFraming::ContentLength]
+            } else {
+                // After reset, only try Content-Length (the more standard format)
+                [McpFraming::ContentLength, McpFraming::ContentLength]
+            };
+
+            let mut last_error: Option<McpServerManagerError> = None;
+            let mut success = false;
+
+            for &framing in &framing_attempts {
+                // Set framing format for this attempt
+                {
+                    let server = self.server_mut(server_name)?;
+                    if let Some(process) = server.process.as_mut() {
+                        process.set_framing(framing);
+                    }
+                }
+
+                let request_id = self.take_request_id();
+                let response = {
+                    let server = self.server_mut(server_name)?;
+                    let process = server.process.as_mut().ok_or_else(|| {
+                        McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "initialize",
+                            details: "server process missing before initialize".to_string(),
+                        }
+                    })?;
+                    Self::run_process_request(
+                        server_name,
+                        "initialize",
+                        MCP_INITIALIZE_TIMEOUT_MS,
+                        process.initialize(request_id, default_initialize_params()),
+                    )
+                    .await
+                };
+
+                match response {
+                    Ok(resp) => {
+                        if let Some(error) = resp.error {
+                            return Err(McpServerManagerError::JsonRpc {
+                                server_name: server_name.to_string(),
+                                method: "initialize",
+                                error,
+                            });
+                        }
+                        if resp.result.is_none() {
+                            let error = McpServerManagerError::InvalidResponse {
+                                server_name: server_name.to_string(),
+                                method: "initialize",
+                                details: "missing result payload".to_string(),
+                            };
+                            self.reset_server(server_name).await?;
+                            return Err(error);
+                        }
+                        success = true;
+                        break;
+                    }
+                    Err(error) => {
+                        // Only retry on timeout (framing mismatch causes timeout)
+                        if matches!(&error, McpServerManagerError::Timeout { .. }) {
+                            last_error = Some(error);
+                            self.reset_server(server_name).await?;
+                            attempts += 1;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            if !success {
+                return Err(last_error.unwrap_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "initialize",
-                        details: "server process missing before initialize".to_string(),
+                        details: "initialization failed".to_string(),
                     }
-                })?;
-                Self::run_process_request(
-                    server_name,
-                    "initialize",
-                    MCP_INITIALIZE_TIMEOUT_MS,
-                    process.initialize(request_id, default_initialize_params()),
-                )
-                .await
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
-                    self.reset_server(server_name).await?;
-                    attempts += 1;
-                    continue;
-                }
-                Err(error) => {
-                    if Self::should_reset_server(&error) {
-                        self.reset_server(server_name).await?;
-                    }
-                    return Err(error);
-                }
-            };
-
-            if let Some(error) = response.error {
-                return Err(McpServerManagerError::JsonRpc {
-                    server_name: server_name.to_string(),
-                    method: "initialize",
-                    error,
-                });
-            }
-
-            if response.result.is_none() {
-                let error = McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "initialize",
-                    details: "missing result payload".to_string(),
-                };
-                self.reset_server(server_name).await?;
-                return Err(error);
+                }));
             }
 
             let server = self.server_mut(server_name)?;
@@ -1139,11 +1171,20 @@ impl McpServerManager {
     }
 }
 
+/// Framing protocol for MCP stdio communication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpFraming {
+    ContentLength,
+    JsonLines,
+}
+
 #[derive(Debug)]
 pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// The framing format detected for this server
+    framing: McpFraming,
 }
 
 impl McpStdioProcess {
@@ -1170,7 +1211,13 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            framing: McpFraming::JsonLines,
         })
+    }
+
+    /// Set the framing format for this process
+    pub(crate) fn set_framing(&mut self, framing: McpFraming) {
+        self.framing = framing;
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1207,13 +1254,56 @@ impl McpStdioProcess {
     }
 
     pub async fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
-        let encoded = encode_frame(payload);
+        let encoded = match self.framing {
+            McpFraming::ContentLength => encode_frame(payload),
+            McpFraming::JsonLines => {
+                let mut line = payload.to_vec();
+                line.push(b'\n');
+                line
+            }
+        };
         self.write_all(&encoded).await?;
         self.flush().await
     }
 
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut content_length = None;
+        // Read the first line to detect framing format
+        let mut first_line = String::new();
+        let bytes_read = self.stdout.read_line(&mut first_line).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed while reading response",
+            ));
+        }
+
+        let first_line = first_line.trim_end().to_string();
+
+        // Auto-detect: if first line starts with {, it's JSON-lines format
+        if first_line.starts_with('{') {
+            self.framing = McpFraming::JsonLines;
+            return Ok(first_line.into_bytes());
+        }
+
+        // Otherwise parse as Content-Length header
+        self.framing = McpFraming::ContentLength;
+        let mut content_length: Option<usize> = None;
+
+        // Parse the first line as header
+        {
+            let header = first_line.trim_end_matches(['\r', '\n']);
+            if let Some((name, value)) = header.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    let parsed = value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    content_length = Some(parsed);
+                }
+            }
+        }
+
+        // Read remaining headers until blank line
         loop {
             let mut line = String::new();
             let bytes_read = self.stdout.read_line(&mut line).await?;
